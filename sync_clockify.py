@@ -119,6 +119,7 @@ MEETING_KEYWORD_MAP: list[tuple[list[str], str]] = [
     (["super young", "superyoung"],          "Super Young"),
 ]
 MEETING_FALLBACK_PROJECT = "Google Meet - Unassigned"
+GIT_FALLBACK_PROJECT = "Git Project - Unassigned"
 
 # Meetings to skip entirely (not work — checked case-insensitive)
 MEETING_SKIP_KEYWORDS: list[str] = [
@@ -222,13 +223,16 @@ def fetch_commits_events_api(username: str, date_from: str, date_to: str, token:
     page = 1
 
     while page <= 10:  # events API max 10 pages
+        print(f"      Events API page {page}/10...", end="", flush=True)
         params = {"per_page": 100, "page": page}
         try:
             resp = _gh_get(url, params, token)
         except requests.HTTPError:
+            print(" error")
             break
         events = resp.json()
         if not events:
+            print(" empty")
             break
 
         for ev in events:
@@ -263,104 +267,18 @@ def fetch_commits_events_api(username: str, date_from: str, date_to: str, token:
                     "sha": sha,
                 })
 
+        push_count = sum(1 for ev in events if ev.get("type") == "PushEvent")
+        print(f" {len(events)} events ({push_count} pushes)")
         page += 1
         _time.sleep(0.5)
 
     return commits
 
 
-def _discover_mapped_repos(token: str | None) -> dict[str, str]:
-    """Return {repo_name_lower: full_name} for all accessible repos that match our mapping."""
-    if not token:
-        return {}
-    url = f"{GITHUB_API}/user/repos"
-    mapping_keys = set(REPO_PROJECT_MAP.keys())
-    matched: dict[str, str] = {}
-    page = 1
-    while True:
-        resp = _gh_get(url, {"per_page": 100, "page": page, "affiliation": "owner,collaborator,organization_member"}, token)
-        batch = resp.json()
-        if not batch:
-            break
-        for repo in batch:
-            name_lower = repo["name"].lower()
-            if name_lower in mapping_keys:
-                matched[name_lower] = repo["full_name"]
-        if len(batch) < 100:
-            break
-        page += 1
-    return matched
-
-
-def fetch_commits_repo_branches(username: str, date_from: str, date_to: str, token: str | None) -> list[dict]:
-    """Fetch commits from ALL branches of each mapped repo — catches staging/feature work."""
-    if not token:
-        return []
-    repo_map = _discover_mapped_repos(token)
-    if not repo_map:
-        return []
-
-    print(f"    Found {len(repo_map)} mapped repos to scan")
-    commits: list[dict] = []
-    since = f"{date_from}T00:00:00Z"
-    until = f"{date_to}T23:59:59Z"
-
-    for repo_lower, full_name in sorted(repo_map.items()):
-        # List branches
-        try:
-            resp = _gh_get(f"{GITHUB_API}/repos/{full_name}/branches", {"per_page": 100}, token)
-            branches = [b["name"] for b in resp.json()]
-        except requests.HTTPError:
-            continue
-
-        seen_shas: set[str] = set()
-        repo_count = 0
-
-        for branch in branches:
-            page = 1
-            while True:
-                try:
-                    resp = _gh_get(
-                        f"{GITHUB_API}/repos/{full_name}/commits",
-                        {"author": username, "since": since, "until": until, "sha": branch, "per_page": 100, "page": page},
-                        token,
-                    )
-                except requests.HTTPError:
-                    break
-                items = resp.json()
-                if not items or not isinstance(items, list):
-                    break
-                for item in items:
-                    sha7 = item.get("sha", "")[:7]
-                    if sha7 in seen_shas:
-                        continue
-                    seen_shas.add(sha7)
-                    commits.append({
-                        "repo": full_name.split("/")[-1],
-                        "repo_full": full_name,
-                        "message": item.get("commit", {}).get("message", "").split("\n")[0].strip(),
-                        "date": item.get("commit", {}).get("author", {}).get("date", ""),
-                        "sha": sha7,
-                    })
-                    repo_count += 1
-                if len(items) < 100:
-                    break
-                page += 1
-            _time.sleep(0.2)
-
-        if repo_count:
-            print(f"      {full_name}: {repo_count} commits across {len(branches)} branches")
-
-    return commits
-
 
 def fetch_all_commits(username: str, date_from: str, date_to: str, token: str | None) -> list[dict]:
-    """Merge results from repo-branch scan + Search API + Events API, deduplicate by SHA."""
-    print("    Scanning mapped repos (all branches)...")
-    repo_commits = fetch_commits_repo_branches(username, date_from, date_to, token)
-    print(f"    -> {len(repo_commits)} commits from repo branches")
-
-    print("    Querying Search Commits API (default branches + unmapped repos)...")
+    """Merge results from Search API + Events API, deduplicate by SHA."""
+    print("    Querying Search Commits API...")
     search_commits = fetch_commits_search_api(username, date_from, date_to, token)
     print(f"    -> {len(search_commits)} commits from Search API")
 
@@ -368,10 +286,10 @@ def fetch_all_commits(username: str, date_from: str, date_to: str, token: str | 
     events_commits = fetch_commits_events_api(username, date_from, date_to, token)
     print(f"    -> {len(events_commits)} commits from Events API")
 
-    # Deduplicate by SHA — repo-branch results take priority
+    # Deduplicate by SHA — Search API results take priority
     seen: set[str] = set()
     merged: list[dict] = []
-    for c in repo_commits + search_commits + events_commits:
+    for c in search_commits + events_commits:
         if c["sha"] not in seen:
             seen.add(c["sha"])
             merged.append(c)
@@ -1057,17 +975,20 @@ def main() -> None:
     project_name_to_id = get_projects(clockify_key, workspace_id)
     print(f"       {len(project_name_to_id)} active projects found\n")
 
-    # Ensure the fallback meeting project exists
+    # Ensure the fallback projects exist
     if MEETING_FALLBACK_PROJECT not in project_name_to_id and meetings:
         print(f"    [WARN] Clockify project '{MEETING_FALLBACK_PROJECT}' not found.")
         print(f"           Unmapped meetings will be skipped. Create it in Clockify to capture them.\n")
+    if GIT_FALLBACK_PROJECT not in project_name_to_id:
+        print(f"    [WARN] Clockify project '{GIT_FALLBACK_PROJECT}' not found.")
+        print(f"           Unmapped repos will be skipped. Create it in Clockify to capture them.\n")
 
     # ── Step 4: Delete existing entries if --delete-range ────────────────────
     if args.delete_range:
         print("[4/6] Deleting existing script entries in range...")
         user_id = get_user_id(clockify_key)
         # Include both repo-mapped and meeting-mapped project IDs
-        all_project_names = set(REPO_PROJECT_MAP.values()) | {MEETING_FALLBACK_PROJECT}
+        all_project_names = set(REPO_PROJECT_MAP.values()) | {MEETING_FALLBACK_PROJECT, GIT_FALLBACK_PROJECT}
         for keywords, proj in MEETING_KEYWORD_MAP:
             all_project_names.add(proj)
         mapped_project_ids = set()
@@ -1099,10 +1020,8 @@ def main() -> None:
     print("[6/6] Creating Clockify time entries...\n")
 
     created = 0
-    skipped_unmapped = 0
     skipped_no_project = 0
     failed = 0
-    unmapped_repos: set[str] = set()
 
     # Helper to create or preview an entry
     def _create_entry(repo: str, day: str, project_name: str, project_id: str,
@@ -1134,9 +1053,7 @@ def main() -> None:
     for (repo, day), group in sorted(groups.items()):
         project_name = REPO_PROJECT_MAP.get(repo.lower())
         if not project_name:
-            unmapped_repos.add(repo)
-            skipped_unmapped += len(group)
-            continue
+            project_name = GIT_FALLBACK_PROJECT
 
         project_id = project_name_to_id.get(project_name)
         if not project_id:
@@ -1159,7 +1076,7 @@ def main() -> None:
     for repo, gap_day, gap_hours, source_commits in sorted(spread_entries, key=lambda x: (x[0], x[1])):
         project_name = REPO_PROJECT_MAP.get(repo.lower())
         if not project_name:
-            continue
+            project_name = GIT_FALLBACK_PROJECT
         project_id = project_name_to_id.get(project_name)
         if not project_id:
             continue
@@ -1224,15 +1141,11 @@ def main() -> None:
     if meet_created or meet_skipped:
         print(f"    Git entries      : {created - meet_created}")
         print(f"    Meet entries     : {meet_created}")
-    print(f"  Skipped (unmapped) : {skipped_unmapped} commits")
     print(f"  Skipped (no proj)  : {skipped_no_project} commits")
     if meet_skipped:
         print(f"  Skipped meetings   : {meet_skipped} (no matching project)")
     if failed:
         print(f"  Failed             : {failed} entries")
-    if unmapped_repos:
-        print(f"  Unmapped repos     : {', '.join(sorted(unmapped_repos))}")
-        print(f"  (Add these to REPO_PROJECT_MAP in the script to include them)")
     print(f"{'='*60}\n")
 
 
