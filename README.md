@@ -143,7 +143,7 @@ If the token expires, just delete `google_token.json` and run again.
 ## Slack Setup (Optional)
 
 Enables the script to:
-- Pull your Slack **DMs and group DMs** in the date range — including **thread replies** — group them by counterpart (by email domain → Clockify project), and use OpenAI to estimate active time spent per conversation per day
+- Pull your Slack **DMs, group DMs, and channels** (public + private) in the date range — including **thread replies** — group them by counterpart (by email domain → Clockify project), and use OpenAI to estimate active time spent per conversation per day
 - Detect Slack **huddles** and log them with their exact start/end times
 
 ### Step 1: Create a Slack App
@@ -209,7 +209,7 @@ DM time is attributed to the project matching the other person's **email domain*
 
 DMs with counterparts outside those domains fall back to `"Slack - Unassigned"` (create that project in Clockify to capture them, otherwise they're skipped).
 
-For **group DMs** (multi-person conversations), time is attributed to a representative member — the first member whose email domain matches the table above, otherwise the first member with an email.
+For **group DMs and channels** (public + private), time is attributed to a representative participant — the first message sender in the window whose email domain matches the table above, otherwise the first sender with an email (falling back to the member list if nobody else spoke).
 
 **Thread replies** are included: history is scanned up to 180 days before the sync window so replies inside the window are found even when the thread was started earlier (Slack's history API never returns thread replies on its own).
 

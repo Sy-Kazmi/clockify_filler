@@ -172,8 +172,11 @@ SLACK_EMAIL_DOMAIN_PROJECT_MAP: dict[str, str] = {
 }
 SLACK_FALLBACK_PROJECT = "Slack - Unassigned"
 
-# Conversation types to scan: im = 1:1 DMs, mpim = group DMs
-SLACK_CONVERSATION_TYPES = "im,mpim"
+# Conversation types to scan: im = 1:1 DMs, mpim = group DMs, plus channels
+SLACK_CONVERSATION_TYPES = "im,mpim,public_channel,private_channel"
+# Max members resolved when picking a representative for a channel/group with
+# no usable senders in the window (channels can have hundreds of members)
+SLACK_MEMBER_RESOLVE_CAP = 30
 # Scan history this far back before the sync window so thread parents started
 # earlier are still seen — their replies inside the window are otherwise
 # invisible (conversations.history never returns thread replies).
@@ -1001,11 +1004,11 @@ def fetch_slack_activity(
     """
     Returns (dm_groups, huddles, user_cache).
 
-    dm_groups: {(email, YYYY-MM-DD in Melbourne): [messages]} — 1:1 DMs and
-               group DMs (thread replies included), messages filtered to real
-               content (no system/huddle markers). For group DMs, email is a
-               representative member's — preferring one whose domain maps to a
-               Clockify project.
+    dm_groups: {(email, YYYY-MM-DD in Melbourne): [messages]} — 1:1 DMs, group
+               DMs, and channels (thread replies included), messages filtered
+               to real content (no system/huddle markers). For group DMs and
+               channels, email is a representative participant's — preferring
+               one whose domain maps to a Clockify project.
     huddles:   list of {"email", "start_utc", "end_utc", "duration_s", "participants", ...}
     """
     oldest_dt = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=MELB_TZ)
@@ -1020,29 +1023,17 @@ def fetch_slack_activity(
     print(f"    Authed as {me.get('user')} ({my_id}) in {me.get('team')}")
 
     convs = _slack_list_conversations(token)
-    print(f"    {len(convs)} conversations (DMs + group DMs)")
+    print(f"    {len(convs)} conversations (DMs + group DMs + channels)")
 
     dm_groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
     huddles: list[dict] = []
 
     for conv in convs:
         cid = conv["id"]
-        if conv.get("is_mpim"):
-            members = [
-                _slack_resolve_user(token, uid, user_cache)
-                for uid in _slack_conv_members(token, cid)
-                if uid and uid != my_id
-            ]
-            members = [u for u in members if u.get("email") and not u.get("is_bot")]
-            if not members:
-                continue
-            rep = next(
-                (u for u in members if match_email_to_project(u["email"])),
-                members[0],
-            )
-            other_email = rep["email"]
-            conv_name = conv.get("name") or rep.get("name") or cid
-        else:
+        is_group_conv = conv.get("is_mpim") or conv.get("is_channel") or conv.get("is_group")
+
+        if not is_group_conv:
+            # 1:1 DM — resolve the counterpart before fetching so bots are skipped cheaply
             other_user_id = conv.get("user", "")
             if not other_user_id:
                 continue
@@ -1057,6 +1048,37 @@ def fetch_slack_activity(
         msgs = _slack_fetch_history(token, cid, oldest_ts, latest_ts, thread_scan_oldest_ts)
         if not msgs:
             continue
+
+        if is_group_conv:
+            # Group DM or channel: attribute time to a representative counterpart,
+            # preferring one whose email domain maps to a Clockify project.
+            # Candidates come from message senders in the window; fall back to
+            # the member list (capped) when nobody but me spoke.
+            sender_ids: list[str] = []
+            for m in msgs:
+                uid = m.get("user") or ""
+                if uid and uid != my_id and uid not in sender_ids:
+                    sender_ids.append(uid)
+            candidates = [_slack_resolve_user(token, uid, user_cache) for uid in sender_ids]
+            candidates = [u for u in candidates if u.get("email") and not u.get("is_bot")]
+            if not candidates:
+                member_ids = [
+                    uid for uid in _slack_conv_members(token, cid)
+                    if uid and uid != my_id
+                ][:SLACK_MEMBER_RESOLVE_CAP]
+                candidates = [_slack_resolve_user(token, uid, user_cache) for uid in member_ids]
+                candidates = [u for u in candidates if u.get("email") and not u.get("is_bot")]
+            if not candidates:
+                continue
+            rep = next(
+                (u for u in candidates if match_email_to_project(u["email"])),
+                candidates[0],
+            )
+            other_email = rep["email"]
+            if conv.get("is_mpim"):
+                conv_name = conv.get("name") or rep.get("name") or cid
+            else:
+                conv_name = f"#{conv.get('name') or cid}"
 
         for m in msgs:
             ts_raw = m.get("ts", "0")
