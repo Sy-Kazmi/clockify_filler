@@ -1,6 +1,6 @@
 # Clockify Filler
 
-Automatically sync your **GitHub commit activity** and **Google Meet meetings** (with Gemini notes) into **Clockify** time entries.
+Automatically sync your **GitHub commit activity**, **Google Meet meetings** (with Gemini notes), and **Slack DMs + huddles** into **Clockify** time entries.
 
 ---
 
@@ -8,10 +8,11 @@ Automatically sync your **GitHub commit activity** and **Google Meet meetings** 
 
 1. **Fetches GitHub commits** across all branches of your mapped repositories
 2. **Fetches Google Meet events** from your calendar (with Gemini meeting notes from Google Drive)
-3. **Maps** repos and meetings to Clockify projects
-4. **Generates descriptions** using OpenAI GPT (what was done + why)
-5. **Creates time entries** in Clockify with accurate timestamps and durations
-6. **Spreads hours** from heavy commit days to preceding empty weekdays for realistic time distribution
+3. **Fetches Slack DMs and huddles** — groups DMs by counterpart's email domain, logs huddles with their exact duration
+4. **Maps** repos, meetings, and Slack counterparts to Clockify projects
+5. **Generates descriptions** using OpenAI GPT (what was done + why, or summary of the DM)
+6. **Creates time entries** in Clockify with accurate timestamps and durations
+7. **Spreads hours** from heavy commit days to preceding empty weekdays for realistic time distribution
 
 ---
 
@@ -23,6 +24,7 @@ Automatically sync your **GitHub commit activity** and **Google Meet meetings** 
 - A **Clockify** account with an API key
 - *(Optional)* An **OpenAI** API key for GPT-powered descriptions
 - *(Optional)* A **Google Cloud** project for Google Meet + Gemini notes integration
+- *(Optional)* A **Slack** app with a User OAuth Token for DM and huddle logging
 
 ---
 
@@ -138,6 +140,89 @@ If the token expires, just delete `google_token.json` and run again.
 
 ---
 
+## Slack Setup (Optional)
+
+Enables the script to:
+- Pull your Slack **DMs and group DMs** in the date range — including **thread replies** — group them by counterpart (by email domain → Clockify project), and use OpenAI to estimate active time spent per conversation per day
+- Detect Slack **huddles** and log them with their exact start/end times
+
+### Step 1: Create a Slack App
+
+1. Go to https://api.slack.com/apps → **Create New App** → **From scratch**
+2. Name it (e.g., `Clockify Filler`) and pick your workspace
+
+### Step 2: Add User Token Scopes
+
+Use **User Token scopes** (not Bot) so the app reads *your* conversations. In the app's sidebar, go to **OAuth & Permissions** → scroll to **User Token Scopes** → **Add an OAuth Scope** and add each of:
+
+- `users:read`
+- `users:read.email`
+- `im:history`
+- `im:read`
+- `channels:history`
+- `channels:read`
+- `groups:history`
+- `groups:read`
+- `mpim:history`
+- `mpim:read`
+
+> `users:read.email` sometimes requires workspace admin approval. If install is blocked, that's usually why.
+
+### Step 3: Install to Workspace
+
+In **OAuth & Permissions**, click **Install to Workspace** (or **Request to Install** if an admin needs to approve). Approve the scopes in the resulting dialog.
+
+### Step 4: Copy the User OAuth Token
+
+After install, **OAuth & Permissions** shows a **User OAuth Token** that starts with `xoxp-...` (not `xoxb-`). Copy it to `.env`:
+
+```
+SLACK_USER_TOKEN=xoxp-XXXX-XXXX-XXXX-XXXX
+```
+
+### Step 5: (Optional) Test the Fetch
+
+Before running the main sync, you can verify Slack access with the bundled test script, which writes everything it reads to a log file without touching Clockify:
+
+```bash
+python3 slack_fetch_test.py --from 2026-04-01 --to 2026-04-20
+# Logs to slack_fetch.log in the same directory
+
+python3 slack_fetch_test.py --types im                # DMs only
+python3 slack_fetch_test.py --raw-json /tmp/slack.json # also dump raw API payloads
+```
+
+The log's final `HUDDLES` section shows per-huddle duration and a per-email total — useful sanity check before running the real sync.
+
+### How Slack DMs Map to Projects
+
+DM time is attributed to the project matching the other person's **email domain**:
+
+| Email Domain | Clockify Project |
+|---|---|
+| bobbi.com.au | BOBBI |
+| firstpage.com.au | First Page AU |
+| teamgamdom.com | Gamdom |
+| firstpage.nz | First Page NZ |
+| outsourcey.com | Outsourcey |
+| superistgroup.com | Superist Group |
+
+DMs with counterparts outside those domains fall back to `"Slack - Unassigned"` (create that project in Clockify to capture them, otherwise they're skipped).
+
+For **group DMs** (multi-person conversations), time is attributed to a representative member — the first member whose email domain matches the table above, otherwise the first member with an email.
+
+**Thread replies** are included: history is scanned up to 180 days before the sync window so replies inside the window are found even when the thread was started earlier (Slack's history API never returns thread replies on its own).
+
+Only conversation days where **you sent at least one message** are logged. Bots (including Slackbot) and users without an email are ignored.
+
+### How Slack Huddles Are Logged
+
+Each Slack huddle becomes its own Clockify entry with the *exact* start/end from Slack's API. Huddles that are still active (no `date_end` yet) are skipped and picked up on the next run.
+
+The counterpart's email domain determines the project using the same table above.
+
+---
+
 ## Repository to Clockify Project Mapping
 
 The script maps Git repositories to Clockify projects using this configuration (edit in `sync_clockify.py`):
@@ -147,7 +232,7 @@ The script maps Git repositories to Clockify projects using this configuration (
 | bobbi-web-portal, bobbi-portal-api, bobbi-portal, bobbi-lp, outsourcey-web | BOBBI |
 | nexseo, mia, FPAU-STAGING | First Page AU |
 | FPNZ-STAGING | First Page NZ |
-| gamdom, i18n, gamdon-reporting | Gamedom |
+| gamdom, i18n, gamdon-reporting | Gamdom |
 | lisnic, lisnic-frontend | Lisnic |
 | Nicks | Nick's Projects |
 | Outsourcey-client-portal-v2 | Outsourcey |
@@ -167,7 +252,7 @@ Meetings are mapped by keywords in the meeting title:
 | bobbi | BOBBI |
 | nexseo, first page au, fpau | First Page AU |
 | first page nz, fpnz | First Page NZ |
-| gamdom, gamedom | Gamedom |
+| gamdom, gamedom | Gamdom |
 | lisnic | Lisnic |
 | nick | Nick's Projects |
 | outsourcey | Outsourcey |
@@ -233,6 +318,7 @@ python3 sync_clockify.py --from 2026-03-01 --to 2026-03-31 --delete-range
 | `--dry-run` | Preview entries without creating them |
 | `--delete-range` | Delete existing script-created entries before creating new ones |
 | `--no-meets` | Skip Google Meet / Gemini notes integration |
+| `--no-slack` | Skip Slack DM + huddle integration |
 
 ---
 
@@ -281,6 +367,7 @@ clockify_filler/
 ├── client_secret_*.json     # Google OAuth credentials (git-ignored)
 ├── google_token.json        # Cached Google auth token (git-ignored)
 ├── sync_clockify.py         # Main script (safe to commit)
+├── slack_fetch_test.py      # Read-only Slack inspector (safe to commit)
 └── README.md                # This file
 ```
 
@@ -307,6 +394,18 @@ Only events with Google Meet / video conferencing links are included. Regular ca
 
 ### Commits missing from results
 The script scans all branches of mapped repos. If a repo isn't in `REPO_PROJECT_MAP`, its commits are skipped (logged as "unmapped"). Add the repo name to the mapping in `sync_clockify.py`.
+
+### Slack: "SLACK_USER_TOKEN not set" / Slack step is skipped
+Add `SLACK_USER_TOKEN=xoxp-...` to your `.env`. See **Slack Setup** above.
+
+### Slack: "missing_scope" or "not_authed" error
+You're missing one of the required User Token Scopes (usually `users:read.email`). Go back to **OAuth & Permissions**, add the scope, **Reinstall to Workspace**, and copy the new token into `.env`.
+
+### Slack: entries rejected with `Don't use "<" and ">" characters`
+Clockify rejects angle brackets in descriptions. The script auto-sanitises them to parentheses — if you still see this, pull the latest `sync_clockify.py`.
+
+### Slack DM counterpart skipped with "No Clockify project"
+The counterpart's email domain isn't in `SLACK_EMAIL_DOMAIN_PROJECT_MAP` *and* there's no `"Slack - Unassigned"` project in your workspace. Either add the domain to the map or create `"Slack - Unassigned"` in Clockify.
 
 ### Duplicate entries after re-running
 Use `--delete-range` to clean up entries from a previous run before creating new ones:

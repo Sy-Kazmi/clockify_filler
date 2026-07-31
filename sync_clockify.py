@@ -67,6 +67,13 @@ MELB_TZ = ZoneInfo("Australia/Melbourne")
 # ============================================================================
 
 GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "sy-Kazmi")
+# Comma-separated list of GitHub orgs/users to search for known repos in.
+# For each repo in REPO_PROJECT_MAP, the walker tries each org until it finds one.
+GITHUB_ORGS = [
+    o.strip() for o in os.environ.get(
+        "GITHUB_ORGS", "superist-group,Lisnic-com,appscore,smein-org"
+    ).split(",") if o.strip()
+]
 
 GITHUB_API = "https://api.github.com"
 CLOCKIFY_API = "https://api.clockify.me/api/v1"
@@ -95,9 +102,9 @@ REPO_PROJECT_MAP: dict[str, str] = {
     "mia":                          "First Page AU",
     "fpau-staging":                 "First Page AU",
     "fpnz-staging":                 "First Page NZ",
-    "gamdom":                       "Gamedom",
-    "i18n":                         "Gamedom",
-    "gamdon-reporting":             "Gamedom",
+    "gamdom":                       "Gamdom",
+    "i18n":                         "Gamdom",
+    "gamdon-reporting":             "Gamdom",
     "lisnic":                       "Lisnic",
     "lisnic-frontend":              "Lisnic",
     "nicks":                        "Nick's Projects",
@@ -111,7 +118,7 @@ MEETING_KEYWORD_MAP: list[tuple[list[str], str]] = [
     (["bobbi"],                              "BOBBI"),
     (["nexseo", "first page au", "fpau"],    "First Page AU"),
     (["first page nz", "fpnz"],             "First Page NZ"),
-    (["gamdom", "gamedom"],                  "Gamedom"),
+    (["gamdom", "gamedom"],                  "Gamdom"),
     (["lisnic"],                             "Lisnic"),
     (["nick"],                               "Nick's Projects"),
     (["outsourcey"],                          "Outsourcey"),
@@ -150,6 +157,33 @@ MAX_DURATION_HOURS = 8
 SPREAD_THRESHOLD_H = 5.0    # only spread days with more than this
 SPREAD_LOOKBACK_DAYS = 3    # max gap days to look back
 SPREAD_KEEP_MIN_H = 3.0     # keep at least this many hours on the heavy day
+
+# ── Slack ─────────────────────────────────────────────────────────────────────
+SLACK_API = "https://slack.com/api"
+
+# Email domain (lowercase, no @) -> Clockify project name
+SLACK_EMAIL_DOMAIN_PROJECT_MAP: dict[str, str] = {
+    "bobbi.com.au":       "BOBBI",
+    "firstpage.com.au":   "First Page AU",
+    "teamgamdom.com":     "Gamdom",
+    "firstpage.nz":       "First Page NZ",
+    "outsourcey.com":     "Outsourcey",
+    "superistgroup.com":  "Superist Group",
+}
+SLACK_FALLBACK_PROJECT = "Slack - Unassigned"
+
+# Conversation types to scan: im = 1:1 DMs, mpim = group DMs
+SLACK_CONVERSATION_TYPES = "im,mpim"
+# Scan history this far back before the sync window so thread parents started
+# earlier are still seen — their replies inside the window are otherwise
+# invisible (conversations.history never returns thread replies).
+SLACK_THREAD_LOOKBACK_DAYS = 180
+
+# Bounds for OpenAI-estimated conversation hours per (email, day)
+SLACK_CONV_MIN_HOURS = 0.25
+SLACK_CONV_MAX_HOURS = 3.0
+# Upper bound on messages fed to OpenAI for one (email, day) group
+SLACK_MAX_MSGS_FOR_PROMPT = 80
 
 # ============================================================================
 # GitHub helpers
@@ -276,8 +310,122 @@ def fetch_commits_events_api(username: str, date_from: str, date_to: str, token:
 
 
 
+def _resolve_repo_owner(repo_name: str, orgs: list[str], token: str | None) -> str | None:
+    """Find which org owns `repo_name` by probing each. Returns the org name or None."""
+    for org in orgs:
+        full = f"{org}/{repo_name}"
+        try:
+            resp = requests.get(
+                f"{GITHUB_API}/repos/{full}",
+                headers=_gh_headers(token),
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                return org
+            if resp.status_code in (301, 302):  # moved — follow
+                new_full = resp.json().get("full_name")
+                if new_full and "/" in new_full:
+                    return new_full.split("/", 1)[0]
+        except requests.RequestException:
+            continue
+    return None
+
+
+def fetch_commits_branches_api(
+    repo_names: list[str], orgs: list[str], username: str,
+    date_from: str, date_to: str, token: str | None,
+) -> list[dict]:
+    """
+    Walk every branch of every known repo, collect commits authored by `username`
+    in the date range. Catches commits that live only on feature branches (which
+    the Search Commits API misses because it indexes the default branch).
+
+    `repo_names` are bare repo names. For each, the walker tries each of `orgs`
+    until one returns a 200 on /repos/{org}/{repo}.
+    """
+    since = f"{date_from}T00:00:00Z"
+    until = f"{date_to}T23:59:59Z"
+
+    # Dedupe within this function by full SHA
+    by_sha: dict[str, dict] = {}
+
+    for repo_name in repo_names:
+        owner = _resolve_repo_owner(repo_name, orgs, token)
+        if not owner:
+            print(f"      {repo_name}: not found in {orgs}")
+            continue
+        full = f"{owner}/{repo_name}"
+
+        # 1) List branches
+        branches: list[dict] = []
+        page = 1
+        while page <= 5:
+            try:
+                br_resp = _gh_get(f"{GITHUB_API}/repos/{full}/branches", {"per_page": 100, "page": page}, token)
+            except requests.HTTPError as e:
+                if e.response is not None and e.response.status_code in (404, 403):
+                    break
+                print(f"    [WARN] {full}: list branches failed: {e}")
+                break
+            batch = br_resp.json()
+            if not isinstance(batch, list) or not batch:
+                break
+            branches.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+
+        if not branches:
+            continue
+
+        print(f"      {full}: {len(branches)} branches")
+
+        # 2) For each branch, fetch commits by author in range
+        for br in branches:
+            br_name = br.get("name", "")
+            if not br_name:
+                continue
+            p = 1
+            while p <= 5:
+                params = {
+                    "author": username,
+                    "since": since,
+                    "until": until,
+                    "sha": br_name,
+                    "per_page": 100,
+                    "page": p,
+                }
+                try:
+                    resp = _gh_get(f"{GITHUB_API}/repos/{full}/commits", params, token)
+                except requests.HTTPError as e:
+                    # 409 = empty repo; stop scanning this branch
+                    break
+                items = resp.json()
+                if not isinstance(items, list) or not items:
+                    break
+                for item in items:
+                    full_sha = item.get("sha", "")
+                    if not full_sha or full_sha in by_sha:
+                        continue
+                    commit = item.get("commit", {})
+                    by_sha[full_sha] = {
+                        "repo": repo_name,
+                        "repo_full": full,
+                        "message": commit.get("message", "").split("\n")[0].strip(),
+                        "date": commit.get("author", {}).get("date", ""),
+                        "sha": full_sha[:7],
+                    }
+                if len(items) < 100:
+                    break
+                p += 1
+                _time.sleep(0.15)
+            _time.sleep(0.05)
+
+    return list(by_sha.values())
+
+
 def fetch_all_commits(username: str, date_from: str, date_to: str, token: str | None) -> list[dict]:
-    """Merge results from Search API + Events API, deduplicate by SHA."""
+    """Merge Search API + Events API + per-branch walker; dedupe by SHA."""
     print("    Querying Search Commits API...")
     search_commits = fetch_commits_search_api(username, date_from, date_to, token)
     print(f"    -> {len(search_commits)} commits from Search API")
@@ -286,10 +434,17 @@ def fetch_all_commits(username: str, date_from: str, date_to: str, token: str | 
     events_commits = fetch_commits_events_api(username, date_from, date_to, token)
     print(f"    -> {len(events_commits)} commits from Events API")
 
-    # Deduplicate by SHA — Search API results take priority
+    print(f"    Walking branches of known repos across orgs {GITHUB_ORGS}...")
+    known_repos = sorted(set(REPO_PROJECT_MAP.keys()))
+    branch_commits = fetch_commits_branches_api(
+        known_repos, GITHUB_ORGS, username, date_from, date_to, token,
+    )
+    print(f"    -> {len(branch_commits)} commits from branch walker")
+
+    # Deduplicate by truncated SHA — all three sources use the same 7-char form
     seen: set[str] = set()
     merged: list[dict] = []
-    for c in search_commits + events_commits:
+    for c in search_commits + events_commits + branch_commits:
         if c["sha"] not in seen:
             seen.add(c["sha"])
             merged.append(c)
@@ -338,6 +493,11 @@ def get_projects(api_key: str, workspace_id: str) -> dict[str, str]:
     return {p["name"]: p["id"] for p in projects}
 
 
+def _sanitize_desc(desc: str) -> str:
+    """Clockify rejects '<' and '>' in descriptions (error code 501)."""
+    return desc.replace("<", "(").replace(">", ")")
+
+
 def create_time_entry(
     api_key: str,
     workspace_id: str,
@@ -349,7 +509,7 @@ def create_time_entry(
     body = {
         "start": start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "end": end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "description": description,
+        "description": _sanitize_desc(description),
         "projectId": project_id,
         "billable": True,
     }
@@ -633,6 +793,446 @@ Rules:
 
 
 # ============================================================================
+# Slack
+# ============================================================================
+
+def _slack_call(token: str, endpoint: str, params: dict | None = None) -> dict:
+    """GET a Slack Web API method with rate-limit backoff; raises on ok=false."""
+    params = dict(params or {})
+    last_exc: Exception | None = None
+    for _attempt in range(4):
+        resp = requests.get(
+            f"{SLACK_API}/{endpoint}",
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+            timeout=30,
+        )
+        if resp.status_code == 429:
+            wait = int(resp.headers.get("Retry-After", "2"))
+            print(f"    [slack rate-limit] sleeping {wait}s on {endpoint}")
+            _time.sleep(wait)
+            continue
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            last_exc = e
+            _time.sleep(1)
+            continue
+        data = resp.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"Slack API {endpoint} failed: {data.get('error')}")
+        return data
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"Slack API {endpoint} exhausted retries")
+
+
+def _slack_list_conversations(token: str) -> list[dict]:
+    """List all DM + group-DM conversations the authed user is part of."""
+    convs: list[dict] = []
+    cursor: str | None = None
+    while True:
+        params: dict = {"types": SLACK_CONVERSATION_TYPES, "limit": 200, "exclude_archived": True}
+        if cursor:
+            params["cursor"] = cursor
+        data = _slack_call(token, "users.conversations", params)
+        convs.extend(data.get("channels", []))
+        cursor = data.get("response_metadata", {}).get("next_cursor") or None
+        if not cursor:
+            break
+        _time.sleep(0.3)
+    return convs
+
+
+def _slack_conv_members(token: str, channel_id: str) -> list[str]:
+    """List member user IDs of a conversation (used for group DMs)."""
+    members: list[str] = []
+    cursor: str | None = None
+    while True:
+        params: dict = {"channel": channel_id, "limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            data = _slack_call(token, "conversations.members", params)
+        except (requests.HTTPError, RuntimeError) as e:
+            print(f"    [WARN] slack members for {channel_id}: {e}")
+            break
+        members.extend(data.get("members", []))
+        cursor = data.get("response_metadata", {}).get("next_cursor") or None
+        if not cursor:
+            break
+        _time.sleep(0.3)
+    return members
+
+
+def _slack_fetch_replies(
+    token: str, channel_id: str, thread_ts: str, oldest_ts: str, latest_ts: str,
+) -> list[dict]:
+    """Fetch replies of one thread, filtered to [oldest_ts, latest_ts]."""
+    replies: list[dict] = []
+    cursor: str | None = None
+    while True:
+        params: dict = {
+            "channel": channel_id,
+            "ts": thread_ts,
+            "oldest": oldest_ts,
+            "latest": latest_ts,
+            "limit": 200,
+            "inclusive": True,
+        }
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            data = _slack_call(token, "conversations.replies", params)
+        except (requests.HTTPError, RuntimeError) as e:
+            print(f"    [WARN] slack replies for {channel_id}/{thread_ts}: {e}")
+            break
+        for r in data.get("messages", []):
+            if r.get("ts") != thread_ts:  # parent comes back too; skip it
+                replies.append(r)
+        if not data.get("has_more"):
+            break
+        cursor = data.get("response_metadata", {}).get("next_cursor") or None
+        if not cursor:
+            break
+        _time.sleep(0.4)
+    return replies
+
+
+def _slack_fetch_history(
+    token: str, channel_id: str, oldest_ts: str, latest_ts: str,
+    thread_scan_oldest_ts: str | None = None,
+) -> list[dict]:
+    """
+    Fetch messages in [oldest_ts, latest_ts], including thread replies.
+
+    conversations.history never returns thread replies, so the channel is
+    scanned from thread_scan_oldest_ts (defaults to oldest_ts) to also see
+    thread parents started before the window; in-window replies of those
+    threads come from conversations.replies. Top-level messages outside
+    [oldest_ts, latest_ts] are dropped, and everything is deduped by ts.
+    """
+    scan_oldest = thread_scan_oldest_ts or oldest_ts
+    raw: list[dict] = []
+    cursor: str | None = None
+    while True:
+        params: dict = {
+            "channel": channel_id,
+            "oldest": scan_oldest,
+            "latest": latest_ts,
+            "limit": 200,
+            "inclusive": True,
+        }
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            data = _slack_call(token, "conversations.history", params)
+        except (requests.HTTPError, RuntimeError) as e:
+            print(f"    [WARN] slack history for {channel_id}: {e}")
+            break
+        raw.extend(data.get("messages", []))
+        if not data.get("has_more"):
+            break
+        cursor = data.get("response_metadata", {}).get("next_cursor") or None
+        if not cursor:
+            break
+        _time.sleep(0.4)
+
+    oldest_f, latest_f = float(oldest_ts), float(latest_ts)
+    msgs: list[dict] = []
+    seen_ts: set[str] = set()
+
+    def _add(m: dict) -> None:
+        ts_raw = m.get("ts", "")
+        if not ts_raw or ts_raw in seen_ts:
+            return
+        try:
+            ts = float(ts_raw)
+        except ValueError:
+            return
+        if ts < oldest_f or ts > latest_f:
+            return
+        seen_ts.add(ts_raw)
+        msgs.append(m)
+
+    for m in raw:
+        _add(m)
+        is_thread_parent = m.get("reply_count") and m.get("thread_ts") == m.get("ts")
+        if is_thread_parent and float(m.get("latest_reply") or 0) >= oldest_f:
+            for r in _slack_fetch_replies(token, channel_id, m["ts"], oldest_ts, latest_ts):
+                _add(r)
+
+    msgs.sort(key=lambda m: float(m.get("ts", "0")))
+    return msgs
+
+
+def _slack_resolve_user(token: str, user_id: str, cache: dict[str, dict]) -> dict:
+    if not user_id:
+        return {"id": "", "name": "system", "email": ""}
+    if user_id in cache:
+        return cache[user_id]
+    try:
+        data = _slack_call(token, "users.info", {"user": user_id})
+        u = data.get("user", {})
+        info = {
+            "id": user_id,
+            "name": u.get("real_name") or u.get("name") or user_id,
+            "email": (u.get("profile", {}).get("email") or "").lower(),
+            "is_bot": u.get("is_bot", False),
+        }
+    except Exception:
+        info = {"id": user_id, "name": user_id, "email": "", "is_bot": False}
+    cache[user_id] = info
+    _time.sleep(0.15)
+    return info
+
+
+def match_email_to_project(email: str) -> str | None:
+    """Return project name for an email's domain, or None if no match."""
+    if not email or "@" not in email:
+        return None
+    domain = email.rsplit("@", 1)[-1].lower()
+    return SLACK_EMAIL_DOMAIN_PROJECT_MAP.get(domain)
+
+
+def fetch_slack_activity(
+    token: str, date_from: str, date_to: str,
+) -> tuple[dict[tuple[str, str], list[dict]], list[dict], dict[str, dict]]:
+    """
+    Returns (dm_groups, huddles, user_cache).
+
+    dm_groups: {(email, YYYY-MM-DD in Melbourne): [messages]} — 1:1 DMs and
+               group DMs (thread replies included), messages filtered to real
+               content (no system/huddle markers). For group DMs, email is a
+               representative member's — preferring one whose domain maps to a
+               Clockify project.
+    huddles:   list of {"email", "start_utc", "end_utc", "duration_s", "participants", ...}
+    """
+    oldest_dt = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=MELB_TZ)
+    latest_dt = datetime.strptime(date_to, "%Y-%m-%d").replace(hour=23, minute=59, second=59, tzinfo=MELB_TZ)
+    oldest_ts = f"{oldest_dt.timestamp():.6f}"
+    latest_ts = f"{latest_dt.timestamp():.6f}"
+    thread_scan_oldest_ts = f"{(oldest_dt - timedelta(days=SLACK_THREAD_LOOKBACK_DAYS)).timestamp():.6f}"
+
+    user_cache: dict[str, dict] = {}
+    me = _slack_call(token, "auth.test")
+    my_id = me.get("user_id", "")
+    print(f"    Authed as {me.get('user')} ({my_id}) in {me.get('team')}")
+
+    convs = _slack_list_conversations(token)
+    print(f"    {len(convs)} conversations (DMs + group DMs)")
+
+    dm_groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    huddles: list[dict] = []
+
+    for conv in convs:
+        cid = conv["id"]
+        if conv.get("is_mpim"):
+            members = [
+                _slack_resolve_user(token, uid, user_cache)
+                for uid in _slack_conv_members(token, cid)
+                if uid and uid != my_id
+            ]
+            members = [u for u in members if u.get("email") and not u.get("is_bot")]
+            if not members:
+                continue
+            rep = next(
+                (u for u in members if match_email_to_project(u["email"])),
+                members[0],
+            )
+            other_email = rep["email"]
+            conv_name = conv.get("name") or rep.get("name") or cid
+        else:
+            other_user_id = conv.get("user", "")
+            if not other_user_id:
+                continue
+            if other_user_id == my_id:
+                continue  # skip self-DM ("notes to self" channel)
+            other = _slack_resolve_user(token, other_user_id, user_cache)
+            other_email = other.get("email", "")
+            if other.get("is_bot") or not other_email:
+                continue  # skip bots / slackbot / users without email
+            conv_name = other.get("name", other_email)
+
+        msgs = _slack_fetch_history(token, cid, oldest_ts, latest_ts, thread_scan_oldest_ts)
+        if not msgs:
+            continue
+
+        for m in msgs:
+            ts_raw = m.get("ts", "0")
+            try:
+                ts = float(ts_raw)
+            except ValueError:
+                continue
+            msg_dt = datetime.fromtimestamp(ts, MELB_TZ)
+            day = msg_dt.strftime("%Y-%m-%d")
+            subtype = m.get("subtype", "")
+
+            if subtype == "huddle_thread":
+                room = m.get("room") or {}
+                d_start = int(room.get("date_start") or 0)
+                d_end = int(room.get("date_end") or 0)
+                if not d_start or not d_end or d_end <= d_start:
+                    # Active or missing end — skip for now, will pick up next run
+                    continue
+                duration_s = d_end - d_start
+                start_utc = datetime.fromtimestamp(d_start, tz=timezone.utc)
+                end_utc = datetime.fromtimestamp(d_end, tz=timezone.utc)
+                parts: list[dict] = []
+                for pid in (room.get("participant_history") or room.get("participants") or []):
+                    if pid and not pid.startswith("B"):
+                        parts.append(_slack_resolve_user(token, pid, user_cache))
+                huddles.append({
+                    "email": other_email,
+                    "day": day,
+                    "start_utc": start_utc,
+                    "end_utc": end_utc,
+                    "duration_s": duration_s,
+                    "participants": parts,
+                    "counterpart_name": conv_name,
+                })
+                continue
+
+            if subtype and subtype != "thread_broadcast":
+                # Skip other system messages (channel_join, bot_message, etc.)
+                continue
+            text = (m.get("text") or "").strip()
+            if not text:
+                continue
+
+            sender_id = m.get("user") or ""
+            sender = _slack_resolve_user(token, sender_id, user_cache) if sender_id else {}
+            is_me = (sender_id == my_id)
+
+            dm_groups[(other_email, day)].append({
+                "ts": ts,
+                "time": msg_dt.strftime("%H:%M"),
+                "is_me": is_me,
+                "sender_name": "me" if is_me else (sender.get("name") or conv_name or "them"),
+                "text": text,
+            })
+
+        _time.sleep(0.25)
+
+    # Keep only (email, day) groups where the user actually participated
+    filtered: dict[tuple[str, str], list[dict]] = {}
+    for key, msgs in dm_groups.items():
+        if any(m["is_me"] for m in msgs):
+            filtered[key] = sorted(msgs, key=lambda m: m["ts"])
+
+    return filtered, huddles, user_cache
+
+
+def _slack_message_transcript(messages: list[dict], max_msgs: int) -> str:
+    """Render DM messages as a compact transcript for the OpenAI prompt."""
+    trimmed = messages[-max_msgs:] if len(messages) > max_msgs else messages
+    lines = []
+    for m in trimmed:
+        text = m["text"].replace("\n", " ")
+        if len(text) > 220:
+            text = text[:220] + "..."
+        lines.append(f"[{m['time']}] {m['sender_name']}: {text}")
+    header = ""
+    if len(messages) > max_msgs:
+        header = f"(showing last {max_msgs} of {len(messages)} messages)\n"
+    return header + "\n".join(lines)
+
+
+def build_slack_conversation_entry(
+    email: str, day: str, messages: list[dict],
+    huddle_minutes_same_day: int, openai_key: str | None,
+) -> tuple[float, str]:
+    """
+    Ask OpenAI to estimate time spent on this DM and draft a description.
+    Returns (hours, description). Falls back to a message-count heuristic if OpenAI fails.
+    """
+    transcript = _slack_message_transcript(messages, SLACK_MAX_MSGS_FOR_PROMPT)
+    my_msg_count = sum(1 for m in messages if m["is_me"])
+    their_msg_count = sum(1 for m in messages if not m["is_me"])
+
+    if openai_key:
+        try:
+            prompt = f"""You are estimating active time spent on a Slack DM for a developer's Clockify timesheet.
+
+Counterpart: {email}
+Date: {day}
+Messages I sent: {my_msg_count}
+Messages they sent: {their_msg_count}
+Separate huddle/call time already logged that day: {huddle_minutes_same_day} minutes (do NOT count this — estimate text-chat time only).
+
+Transcript:
+{transcript}
+
+Tasks:
+1) Estimate the ACTIVE time the developer spent reading, thinking, and replying in this DM thread.
+   - Ignore long gaps with no activity.
+   - Typical rapid back-and-forth = ~1 minute per exchange of turns.
+   - Complex technical troubleshooting or code review = more.
+   - Must be between {SLACK_CONV_MIN_HOURS} and {SLACK_CONV_MAX_HOURS} hours.
+2) Write a concise time-entry description:
+   - First line: [Slack] {email} - {day}
+   - Then 2-6 bullets summarising what was discussed (in first person).
+   - Strictly under 2000 characters.
+   - Do not repeat raw message text.
+
+Respond ONLY as JSON: {{"estimated_hours": <float>, "description": "<string>"}}"""
+
+            resp = requests.post(
+                OPENAI_API,
+                headers={"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"},
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 800,
+                    "temperature": 0.2,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=45,
+            )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            import json as _json
+            parsed = _json.loads(content)
+            hours = float(parsed.get("estimated_hours", 0))
+            desc = (parsed.get("description") or "").strip()
+            hours = max(SLACK_CONV_MIN_HOURS, min(hours, SLACK_CONV_MAX_HOURS))
+            if desc and len(desc) < MAX_DESC_LEN:
+                return hours, desc
+        except Exception as e:
+            print(f"    [WARN] OpenAI failed for Slack DM {email} {day}: {e}")
+
+    # Heuristic fallback: ~1 min per message pair, clamped
+    total = max(1, my_msg_count + their_msg_count)
+    est_h = max(SLACK_CONV_MIN_HOURS, min(total / 60.0, SLACK_CONV_MAX_HOURS))
+    lines = "\n".join(f"- {m['sender_name']} {m['time']}: {m['text'][:140]}" for m in messages[:12])
+    desc = (
+        f"[Slack] {email} - {day}\n\n"
+        f"DM exchange ({my_msg_count} sent, {their_msg_count} received). Highlights:\n{lines}"
+    )
+    return est_h, desc[:MAX_DESC_LEN]
+
+
+def build_slack_huddle_description(huddle: dict) -> str:
+    parts = huddle.get("participants") or []
+    dur_min = huddle["duration_s"] // 60
+    # Clockify rejects '<' and '>' in descriptions; use plain parentheses
+    header = f"[Huddle] {huddle['counterpart_name']} ({huddle['email']}) - {huddle['day']}"
+    body = f"\n\nSlack huddle, {dur_min} minutes."
+    if parts:
+        names = ", ".join(p.get("name", p.get("id", "?")) for p in parts)
+        body += f"\nParticipants: {names}"
+    return (header + body)[:MAX_DESC_LEN]
+
+
+def _slack_entry_start_end(messages: list[dict], hours: float) -> tuple[datetime, datetime]:
+    """Use the first message's timestamp as start; end = start + estimated hours."""
+    first = min(messages, key=lambda m: m["ts"])
+    start_utc = datetime.fromtimestamp(first["ts"], tz=timezone.utc)
+    end_utc = start_utc + timedelta(hours=hours)
+    return start_utc, end_utc
+
+
+# ============================================================================
 # Aggregation & formatting
 # ============================================================================
 
@@ -911,6 +1511,10 @@ def main() -> None:
         "--no-meets", action="store_true",
         help="Skip Google Meet / Gemini notes integration",
     )
+    parser.add_argument(
+        "--no-slack", action="store_true",
+        help="Skip Slack DM + huddle integration",
+    )
     args = parser.parse_args()
 
     # -- Resolve date range ---------------------------------------------------
@@ -965,8 +1569,26 @@ def main() -> None:
     else:
         print("[2/6] Skipping Google Meet (--no-meets)\n")
 
-    if not commits and not meetings:
-        print("[DONE] No commits or meetings found. Nothing to sync.")
+    # ── Step 2b: Fetch Slack DMs + huddles ───────────────────────────────────
+    slack_dm_groups: dict[tuple[str, str], list[dict]] = {}
+    slack_huddles: list[dict] = []
+    slack_token = os.environ.get("SLACK_USER_TOKEN")
+
+    if not args.no_slack and slack_token:
+        print("[2b]  Fetching Slack DMs + huddles...")
+        try:
+            slack_dm_groups, slack_huddles, _ = fetch_slack_activity(slack_token, date_from, date_to)
+            print(f"       {len(slack_dm_groups)} DM (email, day) groups, {len(slack_huddles)} huddles\n")
+        except Exception as e:
+            print(f"       [WARN] Slack fetch failed: {e}")
+            print("       Continuing without Slack...\n")
+    elif args.no_slack:
+        print("[2b]  Skipping Slack (--no-slack)\n")
+    else:
+        print("[2b]  Skipping Slack (SLACK_USER_TOKEN not set)\n")
+
+    if not commits and not meetings and not slack_dm_groups and not slack_huddles:
+        print("[DONE] No commits, meetings, or Slack activity found. Nothing to sync.")
         return
 
     # ── Step 3: Connect to Clockify ──────────────────────────────────────────
@@ -988,9 +1610,12 @@ def main() -> None:
         print("[4/6] Deleting existing script entries in range...")
         user_id = get_user_id(clockify_key)
         # Include both repo-mapped and meeting-mapped project IDs
-        all_project_names = set(REPO_PROJECT_MAP.values()) | {MEETING_FALLBACK_PROJECT, GIT_FALLBACK_PROJECT}
+        all_project_names = set(REPO_PROJECT_MAP.values()) | {
+            MEETING_FALLBACK_PROJECT, GIT_FALLBACK_PROJECT, SLACK_FALLBACK_PROJECT,
+        }
         for keywords, proj in MEETING_KEYWORD_MAP:
             all_project_names.add(proj)
+        all_project_names.update(SLACK_EMAIL_DOMAIN_PROJECT_MAP.values())
         mapped_project_ids = set()
         for proj_name in all_project_names:
             pid = project_name_to_id.get(proj_name)
@@ -1128,22 +1753,88 @@ def main() -> None:
         hours = meeting["duration_h"]
 
         count_label = "(meet)"
-        _create_entry(
+        if _create_entry(
             meeting["summary"][:30], meeting["day"], project_name, project_id,
             description, start_utc, end_utc, hours, "meet", count_label,
+        ):
+            meet_created += 1
+
+    # --- D) Create entries for Slack huddles (exact duration) ---
+    slack_huddle_created = 0
+    slack_conv_created = 0
+    slack_skipped = 0
+
+    def _slack_project_for_email(email: str) -> tuple[str, str] | None:
+        proj_name = match_email_to_project(email) or SLACK_FALLBACK_PROJECT
+        pid = project_name_to_id.get(proj_name)
+        if not pid:
+            return None
+        return proj_name, pid
+
+    # Sum huddle minutes per (email, day) so the conversation estimator can subtract them
+    huddle_min_by_email_day: dict[tuple[str, str], int] = defaultdict(int)
+    for h in slack_huddles:
+        huddle_min_by_email_day[(h["email"], h["day"])] += h["duration_s"] // 60
+
+    if slack_huddles:
+        print("\n  --- Slack Huddle Entries ---\n")
+
+    for h in sorted(slack_huddles, key=lambda x: x["start_utc"]):
+        proj = _slack_project_for_email(h["email"])
+        if not proj:
+            print(f"  [SKIP] No Clockify project for huddle with {h['email']}")
+            slack_skipped += 1
+            continue
+        proj_name, project_id = proj
+        description = build_slack_huddle_description(h)
+        hours = h["duration_s"] / 3600.0
+        count_label = "(huddle)"
+        if _create_entry(
+            f"huddle:{h['email'][:22]}", h["day"], proj_name, project_id,
+            description, h["start_utc"], h["end_utc"], hours, "huddle", count_label,
+        ):
+            slack_huddle_created += 1
+
+    # --- E) Create entries for Slack DM conversations (OpenAI-estimated time) ---
+    if slack_dm_groups:
+        print("\n  --- Slack Conversation Entries ---\n")
+
+    for (email, day), messages in sorted(slack_dm_groups.items()):
+        proj = _slack_project_for_email(email)
+        if not proj:
+            print(f"  [SKIP] No Clockify project for DM with {email}")
+            slack_skipped += 1
+            continue
+        proj_name, project_id = proj
+
+        huddle_mins = huddle_min_by_email_day.get((email, day), 0)
+        hours, description = build_slack_conversation_entry(
+            email, day, messages, huddle_mins, openai_key,
         )
-        meet_created += 1
+        start_utc, end_utc = _slack_entry_start_end(messages, hours)
+        count_label = f"({len(messages)} msgs)"
+        if _create_entry(
+            f"slack:{email[:22]}", day, proj_name, project_id,
+            description, start_utc, end_utc, hours, "slack", count_label,
+        ):
+            slack_conv_created += 1
 
     # ── Summary ──────────────────────────────────────────────────────────────
     label = "WOULD CREATE" if args.dry_run else "CREATED"
+    git_count = created - meet_created - slack_huddle_created - slack_conv_created
     print(f"\n{'='*60}")
     print(f"  {label}       : {created} time entries")
+    print(f"    Git entries      : {git_count}")
     if meet_created or meet_skipped:
-        print(f"    Git entries      : {created - meet_created}")
         print(f"    Meet entries     : {meet_created}")
+    if slack_huddle_created or slack_conv_created:
+        print(f"    Slack huddles    : {slack_huddle_created}")
+        print(f"    Slack DMs        : {slack_conv_created}")
     print(f"  Skipped (no proj)  : {skipped_no_project} commits")
     if meet_skipped:
         print(f"  Skipped meetings   : {meet_skipped} (no matching project)")
+    if slack_skipped:
+        print(f"  Skipped Slack      : {slack_skipped} (no matching project)")
     if failed:
         print(f"  Failed             : {failed} entries")
     print(f"{'='*60}\n")
