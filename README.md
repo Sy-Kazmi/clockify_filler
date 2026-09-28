@@ -241,6 +241,16 @@ The script maps Git repositories to Clockify projects using this configuration (
 
 Unmapped repositories are logged to the console and skipped.
 
+Repos are looked up under each org in `GITHUB_ORGS` and then under your own account (`GITHUB_USERNAME`).
+
+### Commits made under a different git identity
+
+Commits are matched by GitHub login, plus any name or email listed in `GITHUB_AUTHOR_ALIASES`. This catches commits pushed from a machine whose git identity isn't linked to your GitHub account (for example a deploy host committing as "Coolify Host Admin"). Set them in `.env`:
+
+```
+GITHUB_AUTHOR_ALIASES=Coolify Host Admin,claude@superistgroup.com
+```
+
 ---
 
 ## Meeting to Clockify Project Mapping
@@ -394,6 +404,8 @@ Only events with Google Meet / video conferencing links are included. Regular ca
 
 ### Commits missing from results
 The script scans all branches of mapped repos. If a repo isn't in `REPO_PROJECT_MAP`, its commits are skipped (logged as "unmapped"). Add the repo name to the mapping in `sync_clockify.py`.
+
+If the commit's git author name/email isn't your GitHub login (check the commit on GitHub: no avatar/login next to the author), add that name or email to `GITHUB_AUTHOR_ALIASES`.
 
 ### Slack: "SLACK_USER_TOKEN not set" / Slack step is skipped
 Add `SLACK_USER_TOKEN=xoxp-...` to your `.env`. See **Slack Setup** above.

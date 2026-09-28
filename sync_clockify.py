@@ -66,13 +66,22 @@ MELB_TZ = ZoneInfo("Australia/Melbourne")
 # Configuration
 # ============================================================================
 
-GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "sy-Kazmi")
-# Comma-separated list of GitHub orgs/users to search for known repos in.
+GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "").strip()
+# Comma-separated list of GitHub orgs/users to search for known repos in (GITHUB_ORGS env var).
 # For each repo in REPO_PROJECT_MAP, the walker tries each org until it finds one.
+# GITHUB_USERNAME is always appended so repos under your own account are found too.
 GITHUB_ORGS = [
-    o.strip() for o in os.environ.get(
-        "GITHUB_ORGS", "superist-group,Lisnic-com,appscore,smein-org"
-    ).split(",") if o.strip()
+    o.strip() for o in os.environ.get("GITHUB_ORGS", "").split(",") if o.strip()
+]
+if GITHUB_USERNAME and GITHUB_USERNAME.lower() not in {o.lower() for o in GITHUB_ORGS}:
+    GITHUB_ORGS.append(GITHUB_USERNAME)
+
+# Extra git author identities (names or emails, case-insensitive) whose commits
+# should be attributed to you. Needed when commits are made from a machine whose
+# git identity isn't linked to your GitHub account (e.g. a deploy host).
+# Set via a comma-separated GITHUB_AUTHOR_ALIASES env var (empty = none).
+GITHUB_AUTHOR_ALIASES: list[str] = [
+    a.strip() for a in os.environ.get("GITHUB_AUTHOR_ALIASES", "").split(",") if a.strip()
 ]
 
 GITHUB_API = "https://api.github.com"
@@ -97,7 +106,7 @@ REPO_PROJECT_MAP: dict[str, str] = {
     "bobbi-portal-api":             "BOBBI",
     "bobbi-portal":                 "BOBBI",
     "bobbi-lp":                     "BOBBI",
-    "outsourcey-web":               "BOBBI",
+    "outsourcey-web":               "Outsourcey",
     "nexseo":                       "First Page AU",
     "mia":                          "First Page AU",
     "fpau-staging":                 "First Page AU",
@@ -214,10 +223,44 @@ def _gh_get(url: str, params: dict, token: str | None) -> requests.Response:
     return resp  # unreachable, but keeps linters happy
 
 
+def _is_my_commit(username: str, login: str | None, author_name: str, author_email: str) -> bool:
+    """True if a commit belongs to `username` — by GitHub login or by any alias name/email."""
+    if login and login.lower() == username.lower():
+        return True
+    name_l = (author_name or "").lower()
+    email_l = (author_email or "").lower()
+    if username.lower() and (username.lower() in name_l or username.lower() in email_l):
+        return True
+    for alias in GITHUB_AUTHOR_ALIASES:
+        a = alias.lower()
+        if a == name_l or a == email_l:
+            return True
+    return False
+
+
+def _search_queries(username: str, date_from: str, date_to: str) -> list[str]:
+    """One Search Commits query per identity (login + each alias name/email)."""
+    rng = f"author-date:{date_from}..{date_to}"
+    queries = [f"author:{username} {rng}"]
+    for alias in GITHUB_AUTHOR_ALIASES:
+        if "@" in alias:
+            queries.append(f"author-email:{alias} {rng}")
+        else:
+            queries.append(f'author-name:"{alias}" {rng}')
+    return queries
+
+
 def fetch_commits_search_api(username: str, date_from: str, date_to: str, token: str | None) -> list[dict]:
     """Primary: GitHub Search Commits API — works across all repos the token can see."""
-    query = f"author:{username} author-date:{date_from}..{date_to}"
     url = f"{GITHUB_API}/search/commits"
+    commits: list[dict] = []
+    for query in _search_queries(username, date_from, date_to):
+        commits.extend(_run_search_query(url, query, token))
+        _time.sleep(1)
+    return commits
+
+
+def _run_search_query(url: str, query: str, token: str | None) -> list[dict]:
     commits: list[dict] = []
     page = 1
 
@@ -282,7 +325,7 @@ def fetch_commits_events_api(username: str, date_from: str, date_to: str, token:
                 # Only include commits authored by this user
                 author_email = c.get("author", {}).get("email", "")
                 author_name = c.get("author", {}).get("name", "")
-                if username.lower() not in author_name.lower() and username.lower() not in author_email.lower():
+                if not _is_my_commit(username, None, author_name, author_email):
                     continue
 
                 # Use event created_at as approximate commit time
@@ -340,8 +383,10 @@ def fetch_commits_branches_api(
 ) -> list[dict]:
     """
     Walk every branch of every known repo, collect commits authored by `username`
-    in the date range. Catches commits that live only on feature branches (which
-    the Search Commits API misses because it indexes the default branch).
+    (or any GITHUB_AUTHOR_ALIASES identity) in the date range. Catches commits
+    that live only on feature branches (which the Search Commits API misses
+    because it indexes the default branch), and commits whose git author isn't
+    linked to your GitHub account.
 
     `repo_names` are bare repo names. For each, the walker tries each of `orgs`
     until one returns a 200 on /repos/{org}/{repo}.
@@ -391,7 +436,6 @@ def fetch_commits_branches_api(
             p = 1
             while p <= 5:
                 params = {
-                    "author": username,
                     "since": since,
                     "until": until,
                     "sha": br_name,
@@ -411,6 +455,10 @@ def fetch_commits_branches_api(
                     if not full_sha or full_sha in by_sha:
                         continue
                     commit = item.get("commit", {})
+                    c_author = commit.get("author", {}) or {}
+                    login = (item.get("author") or {}).get("login")
+                    if not _is_my_commit(username, login, c_author.get("name", ""), c_author.get("email", "")):
+                        continue
                     by_sha[full_sha] = {
                         "repo": repo_name,
                         "repo_full": full,
@@ -437,6 +485,8 @@ def fetch_all_commits(username: str, date_from: str, date_to: str, token: str | 
     events_commits = fetch_commits_events_api(username, date_from, date_to, token)
     print(f"    -> {len(events_commits)} commits from Events API")
 
+    if GITHUB_AUTHOR_ALIASES:
+        print(f"    Also matching author aliases: {GITHUB_AUTHOR_ALIASES}")
     print(f"    Walking branches of known repos across orgs {GITHUB_ORGS}...")
     known_repos = sorted(set(REPO_PROJECT_MAP.keys()))
     branch_commits = fetch_commits_branches_api(
@@ -1566,6 +1616,8 @@ def main() -> None:
 
     if not clockify_key:
         sys.exit("[ERROR] CLOCKIFY_API_KEY not set. Add it to .env or export it.")
+    if not GITHUB_USERNAME:
+        sys.exit("[ERROR] GITHUB_USERNAME not set. Add it to .env or export it.")
 
     if not github_token:
         print("[WARN] GITHUB_TOKEN not set — only public repos will be searched.")
